@@ -1,0 +1,36 @@
+# ---- OS / editor junk ----
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+*~
+
+# ---- env & secrets (never commit) ----
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+
+# ---- logs / temp / build output ----
+*.log
+tmp/
+dist/
+build/
+coverage/
+.coverage
+
+# ---- Python (keep uv.lock committed: it is authoritative) ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# ---- Node ----
+node_modules/
