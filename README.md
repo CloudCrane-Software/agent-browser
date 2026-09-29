@@ -14,7 +14,26 @@
 | `src/agent_browser/driver.py` | `BrowserDriver` 协议（goto / click / type / extract / screenshot / close）+ `FakeDriver` 内存实现 + `DriverError` + `is_browser_driver` 结构化检查 |
 | `src/agent_browser/task.py` | `BrowserTask`（url / domain_allowlist / max_actions / timeout_s / tenant_id / session_id）+ `run_task`：动作循环、**allowlist 硬拦**（越域 URL → BLOCKED，导航不发生）、**动作数/超时双熔断**、每动作审计事件 |
 | `src/agent_browser/sessions.py` | `SessionManager`：session_id → 独立 storage 命名空间 + 独立驱动实例；destroy 即关闭并摘除（不复用，防串会话） |
-| `tests/` | pytest 26 例：allowlist（越域/相似域/子域/非 http/重定向后越域）、熔断、审计卫生、会话隔离 |
+| `src/agent_browser/search/` | **搜索/抓取能力通用化（线3）**：`search.py`（`SearchProvider` 协议 + DDG HTML 版 + Bing 兜底，去重、≤10 条/查询）、`fetch.py`（两栈路由：httpx 先行 + 转渲染判定 + robots 开关 + allowlist/重定向复检）、`extract.py`（readability 简化正文抽取）、`server.py`（POST /search、POST /fetch、GET /health + `mount_search_fetch` 并入缝）。需 `pip install -e .[search]` |
+| `tests/` | pytest：allowlist（越域/相似域/子域/非 http/重定向后越域）、熔断、审计卫生、会话隔离 + 线3 搜索/抓取/抽取/服务面（mock httpx + 固定 DDG/Bing fixture） |
+
+## 搜索/抓取（线3）安全与路由语义
+
+- **两栈路由（先轻后重）**：httpx 直抓先行（浏览器 UA/超时/重定向跟随）；命中
+  401/403/429/5xx、空 body、meta refresh、SPA 壳（挂载点特征+文本占比<8%）、非
+  HTML content-type 之一 → 转渲染栈（`render_fn` 接缝注入 playwright，本包不依赖；
+  未注入返回 `NEEDS_RENDER`——降级不删除）；
+- **fetch allowlist 硬拦**：配置后目标 host 与**重定向落点**都必须命中（复用
+  `task.host_allowed` 单一实现）；未配置 = fail-closed 全拒；
+- **robots 尊重开关**：默认开，robots.txt 不可得/解析失败按 fail-closed 拒抓
+  （UNKNOWN≠PASS）；内网/自有站点可显式关；
+- **搜索源白名单内置**：`SEARCH_PROVIDER_ALLOWLIST = ("duckduckgo", "bing")`，
+  服务端点对名单外 provider 直接 403，不外发请求；搜索质量红线：URL+标题+摘要
+  结构化、按归一化 URL 去重、每查询 ≤10 条；限速礼仪 `min_interval_s` 串行节流；
+- **SearXNG 不接（本轮决策）**：CNB Git-Platform 无搜索 key 的现实下，自托管
+  SearXNG 需 srv-1 常驻容器+出口 IP 反爬未验证+ACL 运维负担——可行性评估见
+  `agent_browser/search/search.py` 模块 docstring，[待 owner] 后续按需立项；
+  provider 协议已留缝，未来实现同一协议即可接入。
 
 ## 安全语义（确定性系统决定权限）
 
