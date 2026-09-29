@@ -34,3 +34,6 @@ venv/
 
 # ---- Node ----
 node_modules/
+
+# Mimosa hook local state (never commit)
+.mimosa/
