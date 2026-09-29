@@ -180,15 +180,16 @@ class PlaywrightDriver:
     # ---------------------------------------------------------------- 生命周期
 
     def _import_playwright(self):
+        # 注意：返回的是 sync_playwright 可调用物本身——顶层 `playwright` 包
+        # 没有 sync_playwright 属性（在 playwright.sync_api 子模块），GPU 实测抓过
         try:
-            from playwright.sync_api import sync_playwright  # noqa: F401
+            from playwright.sync_api import sync_playwright
         except ImportError as exc:
             raise DriverError(
                 "playwright 未安装：先 `pip install 'playwright>=1.49'`，"
                 "再 `playwright install chromium-headless-shell`（部署目标："
                 "GPU 机 venv，BP §2.1）；原错误：%s" % exc) from exc
-        import playwright
-        return playwright
+        return sync_playwright
 
     def _launch_args(self) -> List[str]:
         args = self.launch_profile.get("args")
@@ -203,7 +204,7 @@ class PlaywrightDriver:
             if self._playwright_factory is not None:  # 测试缝：免真 playwright
                 factory = self._playwright_factory
             else:
-                factory = self._import_playwright().sync_playwright
+                factory = self._import_playwright()
             self._pw = factory().start()
             chromium = self._pw.chromium
             args = self._launch_args()

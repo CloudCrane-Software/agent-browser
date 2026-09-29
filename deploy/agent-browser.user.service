@@ -1,0 +1,32 @@
+# agent-browser 无头浏览器服务（用户级 systemd 变体，GPU 机 anolis-gpu-01）
+# 系统级 /etc/systemd/system 安装被 sudo 口令阻塞（实测 anolisos 被拒）[需人类]，
+# 先以 anuser 的用户级单元 + linger 落地；sudo 可用后按 deploy/agent-browser.service
+# 升级为系统级（内容除 User=/WantedBy 外一致）。
+[Unit]
+Description=agent-browser headless browser service (CloudCrane 线2, user-systemd)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/gpumachine/agent-browser/app
+Environment=AB_BIND_IP=100.64.0.7
+Environment=AB_PORT=8125
+Environment=AB_MAX_SESSIONS=8
+Environment=AB_CONTEXT_ROOT=/opt/gpumachine/agent-browser/contexts
+Environment=AB_IDLE_TTL_S=900
+Environment=PYTHONPATH=/opt/gpumachine/agent-browser/app/src
+Environment=PYTHONUNBUFFERED=1
+# launch-profile.json（线1 交付物）落 /opt/gpumachine/agent-browser/launch-profile.json
+# 时自动优先于 BP §2.5 默认 flags（模块内查找序，无需在此配置）。
+ExecStart=/opt/gpumachine/agent-browser/venv/bin/python -m agent_browser.server
+Restart=on-failure
+RestartSec=3
+# BP §2.5 僵尸治理的服务级兜底：SIGTERM 主进程（httpd 优雅停）+ 杀残余组员，
+# 超时 SIGKILL；配合池看门狗（user-data-dir 标记收割）双保险。
+KillMode=mixed
+TimeoutStopSec=20
+NoNewPrivileges=true
+PrivateTmp=false
+
+[Install]
+WantedBy=default.target
