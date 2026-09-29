@@ -1,0 +1,35 @@
+# agent-browser 无头浏览器服务（部署目标：anolis-gpu-01，tailnet 100.64.0.7）
+# 安装（GPU 机）：
+#   sudo cp deploy/agent-browser.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now agent-browser
+# 绑定纪律：只听 tailnet 地址 100.64.0.7:8125（无 TLS/认证，靠 tailnet 边界）。
+[Unit]
+Description=agent-browser headless browser service (CloudCrane WO 线2)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=anuser
+Group=anuser
+WorkingDirectory=/opt/gpumachine/agent-browser/app
+Environment=AB_BIND_IP=100.64.0.7
+Environment=AB_PORT=8125
+Environment=AB_MAX_SESSIONS=8
+Environment=AB_CONTEXT_ROOT=/opt/gpumachine/agent-browser/contexts
+Environment=AB_IDLE_TTL_S=900
+# launch-profile.json（线1 交付物）落 /opt/gpumachine/agent-browser/launch-profile.json
+# 时自动优先于 BP §2.5 默认 flags（模块内查找序，无需在此配置）。
+ExecStart=/opt/gpumachine/agent-browser/venv/bin/python -m agent_browser.server
+Restart=on-failure
+RestartSec=3
+# BP §2.5 僵尸治理的服务级兜底：SIGTERM 主进程（httpd 优雅停）+ 杀残余组员，
+# 超时 SIGKILL；配合池看门狗（user-data-dir 标记收割）双保险。
+KillMode=mixed
+TimeoutStopSec=20
+# 温和加固（不破坏 chrome-headless-shell 运行；更强隔离=容器化 [待]）
+NoNewPrivileges=true
+PrivateTmp=false
+
+[Install]
+WantedBy=multi-user.target
