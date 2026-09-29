@@ -375,6 +375,9 @@ def create_server(bind_ip=None, port=None, service=None, pool_kwargs=None):
         pool_kwargs.setdefault("max_size",
                                int(os.environ.get("AB_MAX_SESSIONS", "8")))
         pool_kwargs.setdefault("idle_ttl_s", _env_float("AB_IDLE_TTL_S", 900.0))
+        env_root = os.environ.get("AB_CONTEXT_ROOT")
+        if env_root:                       # systemd unit 设定每会话 user-data-dir 根
+            pool_kwargs.setdefault("context_root", env_root)
         pool_kwargs.setdefault("driver_name", "playwright")
         service = BrowserService(pool=BrowserPool(**pool_kwargs))
     httpd = ThreadingHTTPServer((bind_ip, port), _make_handler(service))
