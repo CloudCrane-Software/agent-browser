@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 from typing import Any
@@ -104,10 +105,19 @@ def _call(method: str, path: str, payload: dict | None = None):
                         % (BROWSER_URL, reason)) from None
 
 
+# 会话 id 白名单：服务端签发形如 bsess-<hex>；此处防 URL 路径注入
+# （Mimosa finding:141e60d28 SSRF hardening——id 只进固定前缀后的 path 段）
+_SID_OK = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
 def _need(session_id: str, name: str) -> str:
     if not isinstance(session_id, str) or not session_id.strip():
         raise ToolError("%s required（先 browser_open 创建会话）" % name)
-    return session_id.strip()
+    sid = session_id.strip()
+    if not _SID_OK.match(sid):
+        raise ToolError("illegal %s（只允许 [A-Za-z0-9._-]，"
+                        "应以 browser_open 返回值为准）" % name)
+    return sid
 
 
 # ---------------------------------------------------------------------------
