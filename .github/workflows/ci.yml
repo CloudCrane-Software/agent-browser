@@ -3,7 +3,9 @@
 # 各有 ci.yml，glue ci.yml 同款门禁动机）。
 # 元资产纪律（PROP-0001 v2.1 §11/§14）：本文件改动强制 owner PR 审（zizmor 常开）。
 # 口径：仓根裸 pytest 全量，floor 断言随上游如实核查回填（只升不降，不许静默放行）；
-# 当前 floor=26 对应 main=95869cd 本地实测 26 passed（test_sessions 8 + test_task 18）。
+# 当前 floor=73 对应 main=6283bcb 本地实测 73 passed（原 26 + 线2 新增 47：
+# test_playwright_driver 18 / test_pool 12 / test_browser_server 17；playwright 为
+# 可选依赖 lazy import，CI `pip install pytest -e .` 不受影响）。
 name: ci
 
 on:
@@ -33,5 +35,5 @@ jobs:
           tail -3 pytest.log
           N="$(grep -oE '[0-9]+ passed' pytest.log | tail -1 | grep -oE '[0-9]+')"
           [ -n "$N" ] || { echo "cannot parse passed count"; tail -30 pytest.log; exit 1; }
-          [ "$N" -ge 26 ] || { echo "passed=$N < 26 (upstream changed? re-verify and re-ratchet, never silently loosen)"; exit 1; }
-          echo "agent-browser floor OK: $N passed (>= 26)"
+          [ "$N" -ge 73 ] || { echo "passed=$N < 73 (upstream changed? re-verify and re-ratchet, never silently loosen)"; exit 1; }
+          echo "agent-browser floor OK: $N passed (>= 73)"
