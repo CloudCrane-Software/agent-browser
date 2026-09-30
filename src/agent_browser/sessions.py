@@ -12,6 +12,9 @@
 - 借出/归还语义：``acquire`` 占一个池槽并绑定**每会话独立 user-data-dir** 的
   persistent context（cookie/storage 进程级隔离）；``release`` 归还即销毁——
   context.close() + browser.close() 双保险 + 进程树兜底杀；
+- 容量上限原子性（x2fix-R1）：acquire 检查通过即在锁内占预订占位
+  （计入 len(entries)），驱动工厂锁外执行后回填，失败即回滚——池规模
+  恒 ≤ max_size，并发 /session 突发不可突破（此前检查与占位分离）。
 - 容量口径（BP §2.5）：32G/8C 单机经验值 20–40 并发，池默认 ``max_size=8``
   保守起步；
 - 看门狗（BP §2.5 生产第一杀手=僵尸进程，实证 1.6 万孤儿 chrome 撞 pid_max）：
@@ -204,13 +207,31 @@ class BrowserPool:
     # ------------------------------------------------------------- 借出 / 归还
 
     def acquire(self, tenant_id="default", timeout_s=30.0):
-        """借出一个会话（池满时等待至多 timeout_s；None=不等待）。"""
+        """借出一个会话（池满时等待至多 timeout_s；None=不等待）。
+
+        锁内预订（x2fix-R1）：检查通过即在 ``self._entries`` 占一个
+        ``session=None`` 的预订占位（计入 ``len(self._entries)``），Chrome
+        驱动工厂在锁外执行完毕后回填真身；工厂失败/池被并发关闭即回滚
+        占位并唤醒等待者。修复前检查与占位分离（放锁后才在 :244 占位），
+        N 个并发 acquire 可同时通过检查→并行拉起 N 个驱动，池实际规模
+        远超 max_size（grok X2-R3，medium）。
+        """
         deadline = None if timeout_s is None else self._now() + timeout_s
         with self._slot:
             while True:
                 if self._closed:
                     raise PoolClosed("pool is shut down")
                 if len(self._entries) < self.max_size:
+                    sid = "bsess-%s" % uuid.uuid4().hex[:8]
+                    while sid in self._entries:
+                        sid = "bsess-%s" % uuid.uuid4().hex[:8]
+                    user_data_dir = os.path.join(
+                        self.context_root, "bsess-%s" % uuid.uuid4().hex[:12])
+                    now = self._now()
+                    # 预订：占位立即可见，后续并发检查同一把锁看到已占
+                    self._entries[sid] = _PoolEntry(
+                        session=None, user_data_dir=user_data_dir,
+                        created_monotonic=now, last_used_monotonic=now)
                     break
                 remaining = None if deadline is None else deadline - self._now()
                 if remaining is not None and remaining <= 0:
@@ -218,17 +239,15 @@ class BrowserPool:
                         "pool exhausted: %d/%d sessions in use"
                         % (len(self._entries), self.max_size))
                 self._slot.wait(remaining if remaining is not None else 0.1)
-        user_data_dir = os.path.join(
-            self.context_root, "bsess-%s" % uuid.uuid4().hex[:12])
         os.makedirs(self.context_root, exist_ok=True)
         try:
             driver = self._factory(user_data_dir)
         except Exception:
             shutil.rmtree(user_data_dir, ignore_errors=True)
+            with self._lock:
+                self._entries.pop(sid, None)
+                self._slot.notify_all()          # 回滚预订，唤醒等待的 acquire
             raise
-        sid = "bsess-%s" % uuid.uuid4().hex[:8]
-        while sid in self._entries:
-            sid = "bsess-%s" % uuid.uuid4().hex[:8]
         session = BrowserSession(
             session_id=sid,
             tenant_id=str(tenant_id or "default"),
@@ -236,11 +255,19 @@ class BrowserPool:
             storage={},
             created_at=datetime.now(timezone.utc).isoformat(),
         )
-        now = self._now()
         with self._lock:
-            self._entries[sid] = _PoolEntry(
-                session=session, user_data_dir=user_data_dir,
-                created_monotonic=now, last_used_monotonic=now)
+            entry = self._entries.get(sid)
+            if entry is None:
+                # 构造期间池被关闭/收割：驱动已出生但无槽位——现关现焚，
+                # 报 PoolClosed（shutdown() 先置 _closed 先清占位，堵住
+                # shutdown 后出生会话泄漏——x2fix-R1 同轮关闭的竞态）
+                self._shutdown_entry(_PoolEntry(
+                    session=session, user_data_dir=user_data_dir))
+                raise PoolClosed("pool is shut down")
+            entry.session = session               # 回填真身（同 sid 同占位）
+            entry.user_data_dir = user_data_dir
+            entry.created_monotonic = self._now()
+            entry.last_used_monotonic = entry.created_monotonic
         return session
 
     def touch(self, session_id):
@@ -348,7 +375,14 @@ class BrowserPool:
 
     def _shutdown_entry(self, entry):
         """BP §2.5 双保险 + 兜底：优雅关 → 进程树杀 → 目录清焚."""
-        driver = entry.session.driver
+        session = entry.session
+        if session is None:
+            # acquire 的预订占位（锁内预订、工厂锁外执行中）被并发
+            # shutdown/TTL 收割：驱动尚未出生，只清目录；acquire 回填时会
+            # 发现占位已不在，自行关驱动并报 PoolClosed（x2fix-R1）
+            shutil.rmtree(entry.user_data_dir, ignore_errors=True)
+            return
+        driver = session.driver
         try:
             if self.close_hook is not None:
                 self.close_hook(driver)
@@ -382,8 +416,18 @@ class BrowserPool:
         return len(entries)
 
     def shutdown(self):
-        """停看门狗 + 关闭全部会话；之后 acquire 抛 PoolClosed。"""
+        """停看门狗 + 关闭全部会话；之后 acquire 抛 PoolClosed。
+
+        ``_closed`` 与全部占位在**同一把锁内**先置先清（x2fix-R1）：
+        此前 stop_watchdog→close_all→另起锁置 _closed 的顺序，给
+        「shutdown 进行中 acquire 检查通过→工厂锁外执行→回填」留了
+        窗口，产出 shutdown 后出生、看门狗已停的孤儿会话。
+        """
         self.stop_watchdog()
-        self.close_all()
         with self._lock:
             self._closed = True
+            sids = list(self._entries)
+            entries = [self._entries.pop(s) for s in sids]
+            self._slot.notify_all()
+        for entry in entries:
+            self._shutdown_entry(entry)

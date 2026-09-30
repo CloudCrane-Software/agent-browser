@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import threading
 import time
 import urllib.parse
 from dataclasses import dataclass, field
@@ -67,22 +68,29 @@ class TaskResult:
 
 
 class AuditTrail:
-    """轻量 append-only 审计（事件列表；ts 为 UTC 墙钟，seq 单调）。"""
+    """轻量 append-only 审计（事件列表；ts 为 UTC 墙钟，seq 单调）。
+
+    线程安全（x2fix-R1 加锁）：BrowserService 的 block/session.close/action
+    事件从 HTTP 线程与会话执行器线程两路追加（越域复检段内即销毁），
+    seq 唯一性与事件序在并发下成立；run_task 单线程路径语义不变。
+    """
 
     def __init__(self):
         self._events = []
         self._seq = 0
+        self._lock = threading.Lock()
 
     def append(self, type, **fields):
-        self._seq += 1
-        event = {
-            "seq": self._seq,
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "type": str(type),
-        }
-        event.update(fields)
-        self._events.append(event)
-        return event
+        with self._lock:
+            self._seq += 1
+            event = {
+                "seq": self._seq,
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "type": str(type),
+            }
+            event.update(fields)
+            self._events.append(event)
+            return event
 
     def events(self):
         return tuple(self._events)
