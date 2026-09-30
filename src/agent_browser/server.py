@@ -187,10 +187,13 @@ class BrowserService:
                 if err is not None:
                     return err
                 if final_url != url and not host_allowed(final_url, record.allowlist):
-                    # 重定向落点也要在 allowlist 内（与 task 层同口径）
+                    # 重定向落点也要在 allowlist 内（与 task 层同口径）；被拦即
+                    # 销毁会话——否则页面停在被禁域，后续 extract/screenshot
+                    # 仍可读取（bfix-R1：此前仅返回 403 不回收会话）
                     self.audit.append("block", session_id=session_id, kind="goto",
                                       target=final_url, ok=False,
                                       reason="ALLOWLIST_VIOLATION_REDIRECT")
+                    self.destroy_session(session_id)
                     return 403, {"error": "ALLOWLIST_VIOLATION_REDIRECT",
                                  "url": final_url}
                 self.pool.touch(session_id)
@@ -205,6 +208,24 @@ class BrowserService:
                 outcome, err = self._run(record, lambda d: d.click(selector))
                 if err is not None:
                     return err
+                # 点击可触发页面内导航（playwright click 会等待已发起的导航
+                # commit）——落点与 goto 同款复检 allowlist；被拦即销毁会话，
+                # 不留可读的越域页面（bfix-R1：此前 click 零 allowlist 校验，
+                # 一步即逃逸白名单）。
+                # 兼容缝（如实登记）：协议六方法不含 current_url，无读数的
+                # 旧驱动在此退化为不设防——本仓两驱动（playwright/Fake）均有
+                # 读数，生产面不受影响。
+                final_url, err = self._run(
+                    record, lambda d: getattr(d, "current_url", "") or "")
+                if err is not None:
+                    return err
+                if final_url and not host_allowed(final_url, record.allowlist):
+                    self.audit.append("block", session_id=session_id, kind="click",
+                                      target=final_url, ok=False,
+                                      reason="ALLOWLIST_VIOLATION_CLICK")
+                    self.destroy_session(session_id)
+                    return 403, {"error": "ALLOWLIST_VIOLATION_CLICK",
+                                 "url": final_url}
                 self.pool.touch(session_id)
                 self.audit.append("action", session_id=session_id, kind="click",
                                   target=selector, ok=True)
