@@ -168,6 +168,62 @@ def test_redirect_to_disallowed_host_blocked(server):
     assert blocks and blocks[0]["target"] == "https://evil.io/"
 
 
+# ------------------------------------------------- 点击/重定向落点闸（bfix-R1）
+
+def test_click_escape_to_disallowed_host_blocked_and_session_closed(server):
+    """页面内点击导航脱离 allowlist：落点复检 + 被拦即关会话（403 后不可再读）."""
+    service, pool, url = server
+
+    class ClickEscapeDriver(FakePoolDriver):
+        current_url = "https://example.com/"
+
+        def click(self, selector):
+            self.current_url = "https://evil.io/"     # 点击触发导航逃逸
+            return {"clicked": selector}
+    service.pool._factory = ClickEscapeDriver
+    sid = new_session(url)
+    status, payload, _ = request(url, "/session/%s/click" % sid,
+                                 {"selector": "a.next"})
+    assert status == 403, payload
+    assert payload["error"] == "ALLOWLIST_VIOLATION_CLICK"
+    assert payload["url"] == "https://evil.io/"
+    assert len(pool) == 0                             # 被拦即关会话，不留可读半开页
+    status, _payload, _ = request(url, "/session/%s/extract" % sid, {})
+    assert status == 404                              # 会话已销毁，读不到被禁域内容
+    blocks = [e for e in service.audit.events()
+              if e["type"] == "block"
+              and e.get("reason") == "ALLOWLIST_VIOLATION_CLICK"]
+    assert blocks and blocks[0]["target"] == "https://evil.io/"
+    assert blocks[0]["kind"] == "click"
+
+
+def test_goto_redirect_block_closes_session_no_readable_page(server):
+    """重定向落点被拦：会话必须销毁——修复前页面停在被禁域仍可 extract 读取."""
+    service, pool, url = server
+
+    class RedirectingDriver(FakePoolDriver):
+        def goto(self, target):
+            return "https://evil.io/"
+    service.pool._factory = RedirectingDriver
+    sid = new_session(url)
+    status, payload, _ = request(url, "/session/%s/goto" % sid,
+                                 {"url": "https://example.com/"})
+    assert status == 403 and payload["error"] == "ALLOWLIST_VIOLATION_REDIRECT"
+    assert len(pool) == 0                             # 不留停在被禁域的可读页面
+    status, _payload, _ = request(url, "/session/%s/extract" % sid, {})
+    assert status == 404
+
+
+def test_click_staying_on_allowlist_unaffected(server):
+    """合规点击不受影响；无 current_url 读数的旧驱动（协议六方法外）退化为
+    不设防——兼容缝如实登记（playwright/Fake 驱动均有读数，生产面不受影响）."""
+    _service, _pool, url = server
+    sid = new_session(url)
+    status, payload, _ = request(url, "/session/%s/click" % sid,
+                                 {"selector": "h1"})
+    assert status == 200 and payload["clicked"] == "h1"
+
+
 # ---------------------------------------------------------------- 错误路径
 
 def test_unknown_session_404_and_unknown_action_404(server):
