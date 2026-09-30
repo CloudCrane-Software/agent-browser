@@ -3,8 +3,8 @@
 # 各有 ci.yml，glue ci.yml 同款门禁动机）。
 # 元资产纪律（PROP-0001 v2.1 §11/§14）：本文件改动强制 owner PR 审（zizmor 常开）。
 # 口径：仓根裸 pytest 全量，floor 断言随上游如实核查回填（只升不降，不许静默放行）；
-# 当前 floor=76 对应 bfix-R1 修复分支本地实测 76 passed（f7c2d24 基线 73 + 点击/
-# 重定向落点闸 3 例；floor 26→76 补棘轮：f7c2d24 时点实为 73，此前未随 PR #4/#6/#7 回填）。
+# 当前 floor=81 对应 x2fix-R1 修复分支本地实测 81 passed（main 582f57f 基线 76 +
+# 池锁内预订/回滚/shutdown 竞态 3 例 + click/goto 落点复检 TOCTOU 2 例；floor 76→81）。
 name: ci
 
 on:
@@ -34,5 +34,5 @@ jobs:
           tail -3 pytest.log
           N="$(grep -oE '[0-9]+ passed' pytest.log | tail -1 | grep -oE '[0-9]+')"
           [ -n "$N" ] || { echo "cannot parse passed count"; tail -30 pytest.log; exit 1; }
-          [ "$N" -ge 76 ] || { echo "passed=$N < 76 (upstream changed? re-verify and re-ratchet, never silently loosen)"; exit 1; }
-          echo "agent-browser floor OK: $N passed (>= 76)"
+          [ "$N" -ge 81 ] || { echo "passed=$N < 81 (upstream changed? re-verify and re-ratchet, never silently loosen)"; exit 1; }
+          echo "agent-browser floor OK: $N passed (>= 81)"

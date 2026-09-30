@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import urllib.error
 import urllib.request
 
@@ -222,6 +223,157 @@ def test_click_staying_on_allowlist_unaffected(server):
     status, payload, _ = request(url, "/session/%s/click" % sid,
                                  {"selector": "h1"})
     assert status == 200 and payload["clicked"] == "h1"
+
+
+# ------------------------------- 点击/重定向落点复检的请求间 TOCTOU（x2fix-R1）
+
+class GatedClickDriver(FakePoolDriver):
+    """click 导航至越域页前挂起：制造并发 extract 插队的时间窗。"""
+
+    def __init__(self, user_data_dir):
+        super().__init__(user_data_dir)
+        self.current_url = "https://example.com/page"
+        self.click_entered = threading.Event()
+        self.release_click = threading.Event()
+
+    def click(self, selector):
+        self.click_entered.set()
+        self.release_click.wait(5)
+        self.current_url = "https://evil.io/landed"    # 点击逃逸到越域页
+        return {"clicked": selector}
+
+    def extract(self, selector=""):
+        return "CROSS-DOMAIN-PAGE-CONTENT:%s" % self.current_url
+
+
+class GatedRedirectDriver(FakePoolDriver):
+    """goto 重定向至越域页前挂起：同上时间窗。"""
+
+    def __init__(self, user_data_dir):
+        super().__init__(user_data_dir)
+        self.goto_entered = threading.Event()
+        self.release_goto = threading.Event()
+
+    def goto(self, target):
+        self.goto_entered.set()
+        self.release_goto.wait(5)
+        return "https://evil.io/redirected"            # 重定向逃逸
+
+    def extract(self, selector=""):
+        return "REDIRECTED-PAGE-CONTENT"
+
+
+def test_click_violation_no_toctou_read_by_concurrent_extract(server):
+    """并发 extract 不得抢在 click 落点复检前读走越域页（x2fix-R1 修复前红证）。
+
+    修复前复检分两次独立提交会话执行器：click 提交与复检提交之间（以及
+    click 执行全程）提交的 extract 会先于复检执行——页面已导航至越域，
+    内容一次性返回调用方，其后复检才发现越域并销毁（grok X2-R3 发现，
+    low）。修复后 click+落点复检为单次提交内的串行段，检出即销毁+cancel。
+    """
+    service, pool, url = server
+    service.pool._factory = GatedClickDriver
+    sid = new_session(url)
+    driver = service.pool.get(sid).driver
+    outcomes = {}
+
+    def do_click():
+        outcomes["click"] = request(url, "/session/%s/click" % sid,
+                                    {"selector": "a.next"})
+
+    click_thread = threading.Thread(target=do_click)
+    click_thread.start()
+    assert driver.click_entered.wait(5)                # click 任务已在执行器上
+    extract_outcomes = {}
+
+    def do_extract():
+        extract_outcomes["extract"] = request(url, "/session/%s/extract" % sid, {})
+
+    extract_thread = threading.Thread(target=do_extract)
+    extract_thread.start()
+    time.sleep(0.15)                                   # extract 已排入单工队列
+    driver.release_click.set()                         # click 续行并复检查落点
+    click_thread.join(15)
+    extract_thread.join(15)
+    click_status, click_payload, _ = outcomes["click"]
+    extract_status, extract_payload, _ = extract_outcomes["extract"]
+    assert click_status == 403 and click_payload["error"] == "ALLOWLIST_VIOLATION_CLICK"
+    assert extract_status == 404                        # 越域内容零外泄（修复后）
+    assert "CROSS-DOMAIN-PAGE-CONTENT" not in repr(extract_payload)
+    assert len(pool) == 0                               # 不留半开会话/槽位
+
+
+def test_goto_redirect_violation_no_toctou_read_by_concurrent_extract(server):
+    """重定向落点复检同款：并发 extract 不得读到重定向后的越域页. """
+    service, pool, url = server
+    service.pool._factory = GatedRedirectDriver
+    sid = new_session(url)
+    driver = service.pool.get(sid).driver
+    outcomes = {}
+
+    def do_goto():
+        outcomes["goto"] = request(url, "/session/%s/goto" % sid,
+                                   {"url": "https://example.com/"})
+
+    goto_thread = threading.Thread(target=do_goto)
+    goto_thread.start()
+    assert driver.goto_entered.wait(5)
+    extract_outcomes = {}
+
+    def do_extract():
+        extract_outcomes["extract"] = request(url, "/session/%s/extract" % sid, {})
+
+    extract_thread = threading.Thread(target=do_extract)
+    extract_thread.start()
+    time.sleep(0.15)
+    driver.release_goto.set()
+    goto_thread.join(15)
+    extract_thread.join(15)
+    goto_status, goto_payload, _ = outcomes["goto"]
+    extract_status, extract_payload, _ = extract_outcomes["extract"]
+    assert goto_status == 403
+    assert goto_payload["error"] == "ALLOWLIST_VIOLATION_REDIRECT"
+    assert extract_status == 404
+    assert "REDIRECTED-PAGE-CONTENT" not in repr(extract_payload)
+    assert len(pool) == 0
+
+
+def test_close_racing_inline_violation_destroy_is_idempotent(server):
+    """close 与越域 inline 销毁竞态：close 侧按已关闭口径返回，不抛未归类错.
+
+    x2fix-R1 守卫（修复自身引入的交互）：close 的排空任务会被 inline 销毁
+    的 cancel_futures 取消，其 pool.release 撞上已归还条目 KeyError——
+    destroy_session 已将其映射为 200 closed（ALREADY_DESTROYED 审计）。
+    """
+    service, pool, url = server
+    service.pool._factory = GatedClickDriver
+    sid = new_session(url)
+    driver = service.pool.get(sid).driver
+    outcomes = {}
+
+    def do_click():
+        outcomes["click"] = request(url, "/session/%s/click" % sid,
+                                    {"selector": "a.next"})
+
+    click_thread = threading.Thread(target=do_click)
+    click_thread.start()
+    assert driver.click_entered.wait(5)
+
+    def do_close():
+        outcomes["close"] = request(url, "/session/%s/close" % sid, {})
+
+    close_thread = threading.Thread(target=do_close)
+    close_thread.start()
+    time.sleep(0.15)                               # close 的排空任务已入队
+    driver.release_click.set()
+    click_thread.join(15)
+    close_thread.join(15)
+    click_status, click_payload, _ = outcomes["click"]
+    close_status, close_payload, _ = outcomes["close"]
+    assert click_status == 403
+    assert click_payload["error"] == "ALLOWLIST_VIOLATION_CLICK"
+    assert close_status == 200 and close_payload == {"closed": sid}
+    assert len(pool) == 0
 
 
 # ---------------------------------------------------------------- 错误路径

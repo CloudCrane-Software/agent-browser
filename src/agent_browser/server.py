@@ -30,7 +30,7 @@ import os
 import signal
 import sys
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import CancelledError, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -111,10 +111,59 @@ class BrowserService:
             pass
         # 先归还（池的优雅关闭会路由进还活着的执行器，保证线程亲和），
         # 再关执行器——顺序反了 close 就只能走进程树兜底
-        self.pool.release(session_id)
+        try:
+            self.pool.release(session_id)
+        except KeyError:
+            # 与越域复检的 inline 销毁竞态（x2fix-R1）：会话已在执行器串行
+            # 段内摘除并归还，池侧无此条目=已关，按已关闭口径返回
+            record.executor.shutdown(wait=False, cancel_futures=True)
+            self.audit.append("session.close", session_id=session_id, ok=True,
+                              reason="ALREADY_DESTROYED")
+            return 200, {"closed": session_id}
         record.executor.shutdown(wait=False, cancel_futures=True)
         self.audit.append("session.close", session_id=session_id, ok=True)
         return 200, {"closed": session_id}
+
+    def _destroy_inline(self, record, block_kind=None, block_target=None,
+                        block_reason=None):
+        """会话执行器线程内同步销毁会话（越域复检命中的串行段内）。
+
+        **调用点必须已在会话自己的执行器线程上**（即 ``_run`` 提交的任务
+        内，如 ``_click_with_recheck``）：此时摘除执行器映射后
+        ``pool.release`` 的优雅关闭回退为当前线程直调
+        ``driver.close()``——playwright sync API 线程亲和不破；再以
+        ``cancel_futures`` 取消队列中尚未开始的任务，保证『检出越域→
+        会话销毁』之间无并发动作可插队。
+
+        x2fix-R1：修复前 click/goto 落点复检与 destroy 都发生在 HTTP 线
+        程侧，destroy 的排空 wait 会让已排队的并发 extract/screenshot
+        先执行完——越域内容已一次性返回调用方后才销毁，单工执行器下唯
+        一彻底的收窄就是把『检出+销毁』放进同一串行段。与
+        ``destroy_session`` 的差别：不得再向本执行器提交排空任务
+        （submit+result 在同一执行器线程上=死锁），故本函数不得在
+        HTTP 线程调用。
+        """
+        session = record.session
+        sid = session.session_id
+        if block_kind is not None:
+            self.audit.append("block", session_id=sid, kind=block_kind,
+                              target=block_target, ok=False,
+                              reason=block_reason)
+        with self._lock:
+            self._sessions.pop(sid, None)
+            self._driver_executors.pop(id(session.driver), None)
+        try:
+            # 取消已排队未执行的动作任务（含正阻塞在本任务上的）——执行
+            # 中的是本任务自身，cancel_futures 不动运行中项，无死锁
+            record.executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:                          # noqa: BLE001 — 清理失败不阻塞销毁
+            pass
+        try:
+            self.pool.release(sid)
+        except Exception:                          # noqa: BLE001 — 池侧已先归还
+            pass
+        self.audit.append("session.close", session_id=sid, ok=True,
+                          reason="VIOLATION_DESTROY")
 
     def _graceful_close(self, driver):
         """池归还时的优雅关闭路径：路由回会话执行器（线程亲和）."""
@@ -183,17 +232,28 @@ class BrowserService:
                                       target=url, ok=False,
                                       reason="ALLOWLIST_VIOLATION")
                     return 403, {"error": "ALLOWLIST_VIOLATION", "url": url}
-                final_url, err = self._run(record, lambda d: d.goto(url))
+
+                def _goto_with_recheck(driver):
+                    # goto 与重定向落点复检合并为单次提交内的串行段（x2fix-R1）：
+                    # 此前 goto 提交与复检提交之间，任一并发 extract/screenshot
+                    # 可排进单工执行器先于复检执行，把刚重定向到的越域页内容
+                    # 读走后才复检查封——内容已一次性外泄（grok X2-R3，low）。
+                    final_url = driver.goto(url)
+                    if final_url != url and not host_allowed(final_url,
+                                                             record.allowlist):
+                        # 复检查中即在同一执行器线程销毁（检出即销毁），
+                        # 『复检→销毁』之间无其他任务可插队
+                        self._destroy_inline(
+                            record, block_kind="goto", block_target=final_url,
+                            block_reason="ALLOWLIST_VIOLATION_REDIRECT")
+                        return final_url, True
+                    return final_url, False
+
+                outcome, err = self._run(record, _goto_with_recheck)
                 if err is not None:
                     return err
-                if final_url != url and not host_allowed(final_url, record.allowlist):
-                    # 重定向落点也要在 allowlist 内（与 task 层同口径）；被拦即
-                    # 销毁会话——否则页面停在被禁域，后续 extract/screenshot
-                    # 仍可读取（bfix-R1：此前仅返回 403 不回收会话）
-                    self.audit.append("block", session_id=session_id, kind="goto",
-                                      target=final_url, ok=False,
-                                      reason="ALLOWLIST_VIOLATION_REDIRECT")
-                    self.destroy_session(session_id)
+                final_url, violated = outcome
+                if violated:
                     return 403, {"error": "ALLOWLIST_VIOLATION_REDIRECT",
                                  "url": final_url}
                 self.pool.touch(session_id)
@@ -205,25 +265,32 @@ class BrowserService:
                 selector = payload.get("selector")
                 if not isinstance(selector, str) or not selector.strip():
                     return 400, {"error": "selector required"}
-                outcome, err = self._run(record, lambda d: d.click(selector))
+
+                def _click_with_recheck(driver):
+                    # click 与落点复检合并为单次提交内的串行段（x2fix-R1）：
+                    # 原理同 goto——playwright click 等待已发起的导航 commit，
+                    # 落点与 goto 同款复检 allowlist；被拦即在同一执行器线程
+                    # 销毁会话，不留可读的越域页面（bfix-R1 语义），并发
+                    # extract/screenshot 抢读越域页的请求间 TOCTOU 窗口就此
+                    # 闭合（此前 click 与复检分两次独立提交）。
+                    # 兼容缝（如实登记，bfix-R1 同款）：协议六方法不含
+                    # current_url，无读数的旧驱动在此退化为不设防——本仓两
+                    # 驱动（playwright/Fake）均有读数，生产面不受影响。
+                    outcome = driver.click(selector)
+                    final_url = getattr(driver, "current_url", "") or ""
+                    if final_url and not host_allowed(final_url,
+                                                      record.allowlist):
+                        self._destroy_inline(
+                            record, block_kind="click", block_target=final_url,
+                            block_reason="ALLOWLIST_VIOLATION_CLICK")
+                        return outcome, final_url, True
+                    return outcome, final_url, False
+
+                result, err = self._run(record, _click_with_recheck)
                 if err is not None:
                     return err
-                # 点击可触发页面内导航（playwright click 会等待已发起的导航
-                # commit）——落点与 goto 同款复检 allowlist；被拦即销毁会话，
-                # 不留可读的越域页面（bfix-R1：此前 click 零 allowlist 校验，
-                # 一步即逃逸白名单）。
-                # 兼容缝（如实登记）：协议六方法不含 current_url，无读数的
-                # 旧驱动在此退化为不设防——本仓两驱动（playwright/Fake）均有
-                # 读数，生产面不受影响。
-                final_url, err = self._run(
-                    record, lambda d: getattr(d, "current_url", "") or "")
-                if err is not None:
-                    return err
-                if final_url and not host_allowed(final_url, record.allowlist):
-                    self.audit.append("block", session_id=session_id, kind="click",
-                                      target=final_url, ok=False,
-                                      reason="ALLOWLIST_VIOLATION_CLICK")
-                    self.destroy_session(session_id)
+                outcome, final_url, violated = result
+                if violated:
                     return 403, {"error": "ALLOWLIST_VIOLATION_CLICK",
                                  "url": final_url}
                 self.pool.touch(session_id)
@@ -287,6 +354,17 @@ class BrowserService:
         try:
             outcome = future.result(timeout=self.action_timeout_s)
         except Exception as exc:                       # noqa: BLE001
+            if isinstance(exc, CancelledError) and future.cancelled():
+                # 会话已因越域复检命中而在同一执行器串行段内销毁，本任务未
+                # 执行即被 cancel_futures 取消（x2fix-R1）——与 destroy 后
+                # 404 同口径，如实映射 unknown session。
+                # future.cancelled() 判别消除误报：fn 内部自行抛出的
+                # CancelledError 不满足此条件（future 已带异常完成），
+                # 仍归 DRIVER_ERROR（grok x2fix-R1 红队复核结论）。
+                self.audit.append("error", session_id=record.session.session_id,
+                                  kind="action", ok=False,
+                                  reason="SESSION_DESTROYED_CANCELLED")
+                return None, (404, {"error": "unknown session"})
             reason = "TIMEOUT" if "TimeoutError" in type(exc).__name__ \
                 else "DRIVER_ERROR"
             self.audit.append("error", session_id=record.session.session_id,
